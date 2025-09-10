@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import threading
-import PySimpleGUI as sg
+import FreeSimpleGUI as sg
 import tempfile
 from pydub import AudioSegment
 import sounddevice as sd
@@ -623,4 +623,3 @@ while True:
 # --- Final Cleanup ---
 TooltipManager.close()
 window.close()
-
