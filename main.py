@@ -12,12 +12,9 @@ from math import exp
 import platform
 
 # --- DPI Awareness Fix for Windows ---
-# This is the standard solution to prevent blurry fonts on high-DPI displays.
-# It tells Windows that the application can handle its own scaling.
 if platform.system() == "Windows":
     try:
         import ctypes
-        # Set process DPI awareness to "System Aware"
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
         print("DEBUG: DPI awareness set to System Aware.")
     except Exception as e:
@@ -77,7 +74,7 @@ class TooltipManager:
 
     @classmethod
     def _schedule_show(cls, widget, text):
-        cls._hide()  # Cancel any previous tooltip
+        cls._hide()
         cls._show_timer = cls._tk_root.after(500, lambda: cls._show(widget, text))
 
     @classmethod
@@ -112,7 +109,6 @@ class TooltipManager:
 
     @classmethod
     def close(cls):
-        """Safely close the tooltip window resource."""
         if cls._tooltip_window:
             cls._tooltip_window.close()
             cls._tooltip_window = None
@@ -150,8 +146,12 @@ fade_lock = threading.Lock()
 fade_thread = None
 stop_after_fade = threading.Event()
 playback_lock = threading.RLock()
-is_seeking = False
+
+# FIX: Replaced boolean flag with a counter for robust race condition handling
+seek_requests = 0
 seek_lock = threading.Lock()
+
+# Scrub/debounce state (only for slider)
 pending_seek_active = False
 pending_seek_value = 0
 pending_seek_time = 0.0
@@ -174,7 +174,6 @@ def get_output_devices():
         ]
         if output_devices:
             return output_devices
-        # Fallback if no devices are found
         return []
     except Exception as e:
         print(f"ERROR: Could not query audio devices: {e}")
@@ -341,7 +340,7 @@ def play_pause():
         threading.Thread(target=start_playback_fast, daemon=True).start()
 
 def stop_immediate():
-    global playing, position, mixed_stream, background_stream, last_tick, fade_gain, stop_after_fade, streams_running, play_session
+    global playing, position, mixed_stream, background_stream, last_tick, fade_gain, stop_after_fade, streams_running, play_session, seek_requests
     print("DEBUG: stop_immediate() called!")
     with playback_lock:
         play_session += 1
@@ -357,34 +356,35 @@ def stop_immediate():
         fade_gain = 1.0
         last_tick = None
         streams_running = False
+        with seek_lock:
+            seek_requests = 0 # Safety reset
         try: stop_after_fade.clear()
         except Exception: pass
 
 def seek(new_position):
-    global position, stop_after_fade, is_seeking
+    global position, stop_after_fade, seek_requests
     print(f"DEBUG: seek() called with new_position: {new_position}")
     
     with seek_lock:
-        is_seeking = True
+        seek_requests += 1
 
     position = int(max(0, min(new_position, int(duration))))
     try: stop_after_fade.clear()
     except Exception: pass
     
     if playing:
-        threading.Thread(target=_restart_playback_at_position, args=(position,), daemon=True).start()
-    else: # If paused, just update position and reset flag
+        threading.Thread(target=_restart_playback_at_position, daemon=True).start()
+    else:
         global last_tick
-        last_tick = None # Reset tick timer
+        last_tick = None
         with seek_lock:
-            is_seeking = False
+            seek_requests -= 1
 
-def _restart_playback_at_position(pos):
-    global position, is_seeking
-    print(f"DEBUG: _restart thread started for position: {pos}")
+def _restart_playback_at_position():
+    global seek_requests
+    print(f"DEBUG: _restart thread started for position: {position}")
     try:
         with playback_lock:
-            position = pos
             start_playback_fast()
     except Exception as e:
         print(f"ERROR: Error restarting playback: {e}")
@@ -392,7 +392,7 @@ def _restart_playback_at_position(pos):
         playing = False
     finally:
         with seek_lock:
-            is_seeking = False
+            seek_requests -= 1
 
 def update_progress_time_based():
     global position, last_tick
@@ -410,30 +410,14 @@ def update_progress_time_based():
     return position
 
 def rewind_5sec():
-    global position, pending_seek_active, pending_seek_value, pending_seek_time, window
     if not audio_loaded: return
     new_pos = max(0, int(position - 5))
-    window['-PROGRESS-'].update(value=new_pos)
-    window['-TIME_DISPLAY-'].update(f"{format_time(new_pos)} / {format_time(duration)}")
-    if not playing:
-        seek(new_pos)
-    else:
-        pending_seek_value = new_pos
-        pending_seek_time = time.time()
-        pending_seek_active = True
+    seek(new_pos)
 
 def forward_5sec():
-    global position, pending_seek_active, pending_seek_value, pending_seek_time, window
     if not audio_loaded: return
     new_pos = min(int(duration), int(position + 5))
-    window['-PROGRESS-'].update(value=new_pos)
-    window['-TIME_DISPLAY-'].update(f"{format_time(new_pos)} / {format_time(duration)}")
-    if not playing:
-        seek(new_pos)
-    else:
-        pending_seek_value = new_pos
-        pending_seek_time = time.time()
-        pending_seek_active = True
+    seek(new_pos)
 
 # ---------------- Mark "needs reload" ----------------
 def mark_needs_reload(window):
@@ -463,7 +447,6 @@ output_devices = get_output_devices()
 device_names = [d[1] for d in output_devices]
 device_ids = {d[1]: d[0] for d in output_devices}
 
-# Gracefully handle systems with < 2 audio devices
 default_headphone = ""
 default_virtual = ""
 if len(device_names) >= 2:
@@ -471,7 +454,7 @@ if len(device_names) >= 2:
     default_virtual = device_names[1]
 elif len(device_names) == 1:
     default_headphone = device_names[0]
-    default_virtual = device_names[0] # Use the same device if only one is available
+    default_virtual = device_names[0]
 
 layout = [
     [sg.Text("歌回伴唱小幫手", font=(CUSTOM_FONT_NAME, 20), justification="center", expand_x=True)],
@@ -492,7 +475,6 @@ layout = [
 ]
 window = sg.Window("白芙妮的伴唱小幫手", layout, finalize=True, return_keyboard_events=True)
 
-# --- Initialize and Attach Custom Tooltips ---
 TooltipManager.init(window)
 tooltip1_text = '這是您自己會聽到的輸出，\n該軌道會輸出伴奏和人聲。\n請確認選擇的兩個輸出設備采樣率相同。'
 tooltip2_text = '這是直播軟體(如OBS)應擷取的輸出，\n通常是一個虛擬音源線(例如VB-CABLE)。\n該軌道僅輸出伴奏。\n請確認選擇的兩個輸出設備采樣率相同。'
@@ -535,8 +517,12 @@ while True:
             window['-TIME_DISPLAY-'].update(f"{format_time(position)} / {format_time(duration)}")
 
     old_pos = position
-    if playing and not pending_seek_active:
-        position = update_progress_time_based()
+    if playing:
+        # Only update position via time if not being actively scrubbed with slider
+        if not pending_seek_active:
+            position = update_progress_time_based()
+        
+        # Always update UI from the 'position' variable as the source of truth
         if int(position) != int(old_pos):
             window["-PROGRESS-"].update(value=int(position))
             window["-TIME_DISPLAY-"].update(f"{format_time(position)} / {format_time(duration)}")
@@ -545,8 +531,6 @@ while True:
         if (time.time() - pending_seek_time) >= SCRUB_DEBOUNCE:
             seek(pending_seek_value)
             pending_seek_active = False
-            window["-PROGRESS-"].update(value=int(position))
-            window["-TIME_DISPLAY-"].update(f"{format_time(position)} / {format_time(duration)}")
 
     window["-PLAY_PAUSE-"].update(text="暫停" if playing else "播放")
     for key in ['-HEADPHONE-', '-VIRTUAL-', '-BG-', '-VOCAL-', '-BG_BROWSE-', '-VOCAL_BROWSE-']: window[key].update(disabled=playing)
@@ -562,14 +546,13 @@ while True:
             sg.popup_error("請選擇所有檔案和輸出設備", title="錯誤")
             continue
 
-        # Add user-friendly warning if devices are the same
         if values.get("-HEADPHONE-") == values.get("-VIRTUAL-"):
             response = sg.popup_yes_no(
                 "警告：您為兩個輸出選擇了相同的設備。這將導致兩個音軌混合在一起發送到同一個地方。\n\n這不是此應用程式的預期用途。您確定要繼續嗎？",
                 title="設備選擇警告"
             )
             if response == 'No':
-                continue # Allow user to change selection
+                continue
 
         headphone_device_id = device_ids.get(values.get("-HEADPHONE-"))
         virtual_device_id = device_ids.get(values.get("-VIRTUAL-"))
@@ -606,11 +589,7 @@ while True:
     if event == "-TW_LINK-": webbrowser.open(TWITTER_URL)
 
     try:
-        is_currently_seeking = False
-        with seek_lock:
-            is_currently_seeking = is_seeking
-
-        if playing and streams_running and not stop_after_fade.is_set() and not is_currently_seeking:
+        if playing and streams_running and not stop_after_fade.is_set() and seek_requests == 0:
             if (mixed_stream and not mixed_stream.active) or \
                (background_stream and not background_stream.active):
                 print(f"DEBUG: Natural end of stream detected.")
@@ -623,3 +602,4 @@ while True:
 # --- Final Cleanup ---
 TooltipManager.close()
 window.close()
+
