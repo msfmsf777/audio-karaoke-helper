@@ -1,0 +1,4 @@
+     numpy==2.3.2
+     pydub==0.25.1
+     PySimpleGUI==5.0.10
+     sounddevice==0.5.2
